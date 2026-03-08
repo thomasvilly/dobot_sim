@@ -1,19 +1,20 @@
 import argparse
-import math
+import random
+import torch
+import numpy as np
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 AppLauncher.add_app_launcher_args(parser)
 simulation_app = AppLauncher(parser.parse_args()).app
 
-import torch
-import numpy as np
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, ArticulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import TiledCameraCfg
-import math
+
+from dobot_kinematics import DobotKinematics
 
 DOBOT_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
@@ -26,7 +27,7 @@ DOBOT_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.212),
+        pos=(0.0, 0.0, 0.112),
         joint_pos={
             "magician_joint_1":         0.0,
             "magician_joint_2":         0.8,
@@ -38,7 +39,7 @@ DOBOT_CFG = ArticulationCfg(
     actuators={
         "joints": ImplicitActuatorCfg(
             joint_names_expr=["magician_joint_.*"],
-            stiffness=100.0,
+            stiffness=50.0,
             damping=10.0,
         ),
     },
@@ -48,125 +49,111 @@ class SceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
     light  = AssetBaseCfg(prim_path="/World/light",  spawn=sim_utils.DomeLightCfg(intensity=3000.0))
     robot  = DOBOT_CFG
-    # Stationary camera looking at the robot from the front-side, matching real setup
     camera = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.5, -0.5, 0.4),   # 50cm front, 50cm to side, 40cm up
-            rot=(0.85, 0.35, -0.15, -0.35),  # angled down toward robot
-            convention="world",
-        ),
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.5, -0.5, 0.4), rot=(0.85, 0.35, -0.15, -0.35), convention="world"),
         data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.01, 10.0),
-        ),
-        width=640,
-        height=480,
+        spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955),
+        width=640, height=480,
     )
+
+def generate_episode(kinematics, robot, scene, sim, camera):
+    """Executes a single pick-and-place trajectory and records the sequence."""
+    
+    # Matching real-world zones from record_simple.py
+    Z_SAFE  = -30.0   
+    Z_PICK  = -75.0  
+    Z_HOVER =  50.0 
+    
+    pick_x  = random.uniform(100, 160)
+    pick_y  = random.uniform(-120, 0)
+    place_x = random.uniform(140, 220)
+    place_y = random.uniform(80, 200)
+
+    # Define the high-level PTP trajectory waypoints (X, Y, Z, Gripper)
+    waypoints = [
+        [150.0, 40.0, Z_SAFE, -1.0],      # 1. Start at safe home
+        [pick_x, pick_y, Z_HOVER, -1.0],  # 2. Hover over pick
+        [pick_x, pick_y, Z_PICK,   1.0],  # 3. Drop down & GRAB
+        [pick_x, pick_y, Z_HOVER,  1.0],  # 4. Lift up
+        [place_x, place_y, Z_HOVER, 1.0], # 5. Move to place hover
+        [place_x, place_y, Z_PICK, -1.0], # 6. Drop down & RELEASE
+        [place_x, place_y, Z_HOVER, -1.0] # 7. Lift up
+    ]
+
+    episode_data = []
+    current_pos = torch.tensor(waypoints[0][:3], device="cuda").unsqueeze(0)
+    
+    print(f"[INFO] Starting Episode: Pick({pick_x:.1f}, {pick_y:.1f}) -> Place({place_x:.1f}, {place_y:.1f})")
+
+    for target in waypoints:
+        target_pos = torch.tensor(target[:3], device="cuda").unsqueeze(0)
+        gripper_state = torch.tensor([[target[3]]], device="cuda")
+        
+        # Calculate how many 20Hz steps to take based on distance (speed control)
+        dist = torch.norm(target_pos - current_pos).item()
+        steps = max(10, int(dist / 2.0)) # Approx 2mm per frame
+
+        for step in range(steps):
+            # Interpolate to create a smooth path
+            alpha = step / float(steps)
+            interp_pos = current_pos + alpha * (target_pos - current_pos)
+            
+            # 1. Math: XYZ -> SDK Angles -> URDF Targets
+            sdk_angles = kinematics.inverse_kinematics(interp_pos)
+            urdf_targets = kinematics.sdk_to_urdf_targets(sdk_angles)
+            
+            # 2. Physics: Apply targets and step sim
+            robot.set_joint_position_target(urdf_targets)
+            
+            # Step physics 10 times (200Hz) to simulate 1 control frame (20Hz)
+            for _ in range(10):
+                scene.write_data_to_sim()
+                sim.step()
+                scene.update(sim.get_physics_dt())
+
+            # 3. Record: Capture State
+            proprio = kinematics.get_proprio(robot.data.joint_pos, gripper_state)
+            
+            # Assuming camera is enabled and returning valid data
+            img = camera.data.output["rgb"][0].cpu().numpy() if "rgb" in camera.data.output else None
+            
+            episode_data.append({
+                "action": [*interp_pos[0].cpu().numpy(), gripper_state.item()],
+                "proprio": proprio[0].cpu().numpy(),
+                "image": img
+            })
+            
+        current_pos = target_pos # Update for next waypoint
+
+    return episode_data
 
 def main():
     sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=0.005, gravity=(0.0, 0.0, -9.81)))
     scene = InteractiveScene(SceneCfg(num_envs=1, env_spacing=2.0))
     sim.reset()
 
-    robot      = scene["robot"]
-    camera     = scene["camera"]
-    joint_names = robot.data.joint_names
+    robot  = scene["robot"]
+    camera = scene["camera"]
+    kinematics = DobotKinematics(robot.data.joint_names, device="cuda")
 
-    def get_sim_proprio(gripper_on=False):
-        # 1. Read actual simulated joint positions
-        joints = robot.data.joint_pos[0].cpu().numpy()
-        j1 = joints[joint_names.index("magician_joint_1")]
-        j2 = joints[joint_names.index("magician_joint_2")]
-        j3_rel = joints[joint_names.index("magician_joint_3")]
-        
-        # 2. Reconstruct the absolute SDK J3 angle
-        j3 = j3_rel + j2
-        
-        # 3. Dobot SDK Forward Kinematics (Forearm Tip)
-        radius = 135.0 * math.sin(j2) + 147.0 * math.cos(j3)
-        z = 135.0 * math.cos(j2) - 147.0 * math.sin(j3)
-        
-        x = radius * math.cos(j1)
-        y = radius * math.sin(j1)
-        
-        grip = 1.0 if gripper_on else -1.0
-        return np.array([x, y, z, grip], dtype=np.float32)
-
-    hold = robot.data.default_joint_pos.clone()
-    j2   = joint_names.index("magician_joint_2")
-    j3   = joint_names.index("magician_joint_3")
-    jp   = joint_names.index("magician_joint_end_pitch")
-    j1   = joint_names.index("magician_joint_1")
-    j4_idx = joint_names.index("magician_joint_4")
-
-    # Settle
+    # Settle the physics engine
     print("[INFO] Settling...")
-    for i in range(400):
-        robot.set_joint_position_target(hold)
+    for _ in range(400):
+        robot.set_joint_position_target(robot.data.default_joint_pos.clone())
         scene.write_data_to_sim()
         sim.step()
         scene.update(sim.get_physics_dt())
 
-    print("[INFO] Settled. Running...")
-    proprio = get_sim_proprio()
-    print(f"  Initial proprio (mm): x={proprio[0]:.1f}  y={proprio[1]:.1f}  z={proprio[2]:.1f}  grip={proprio[3]}")
+    print("[INFO] Settled. Generating episodes...")
 
-    # Verify camera frame shape
-    rgb = camera.data.output["rgb"][0].cpu().numpy()
-    print(f"  Camera frame shape: {rgb.shape}  dtype: {rgb.dtype}  min/max: {rgb.min()}/{rgb.max()}")
+    # Run 3 test episodes
+    for i in range(3):
+        ep_data = generate_episode(kinematics, robot, scene, sim, camera)
+        print(f"--> Episode {i+1} completed with {len(ep_data)} frames.")
 
-    # Three real-world calibration poses (joint angles in DEGREES, converted to radians)
-    cal_poses = {
-        "down":  {"j1": -50.74, "j2": 62.47, "j3": 84.07, "j4": -26.57},
-        "home":  {"j1":  26.55, "j2": 39.98, "j3": 21.34, "j4": -26.57},
-        "up":    {"j1":  86.35, "j2": 38.34, "j3": -5.52, "j4": -26.57},
-    }
-
-    real_xyz = {
-        "down": (85.4,  -104.5,  -83.8),
-        "home": (200.1,  100.0,   50.0),
-        "up":   (14.7,   229.6,  120.0),
-    }
-
-    for name, joints in cal_poses.items():
-        target = torch.zeros(1, len(joint_names), device="cuda")
-        
-        # Base rotation remains 1:1
-        target[:, j1] = math.radians(joints["j1"])
-        
-        # J2 in SDK is angle from vertical. URDF 0 is vertical. (1:1 mapping)
-        target[:, j2] = math.radians(joints["j2"])
-        
-        # J3 in SDK is the absolute angle of Link 3 below horizontal. 
-        # URDF requires the relative angle from Link 2.
-        target[:, j3] = math.radians(joints["j3"] - joints["j2"])
-        
-        # Map SDK j4 (yaw) to the actual yaw joint
-        target[:, j4_idx] = math.radians(joints["j4"])
-        
-        # Visually level the suction cup (Pitch opposes total Link 3 angle)
-        target[:, jp] = math.radians(-joints["j3"])
-
-        # Settle at this pose
-        for _ in range(100):
-            robot.set_joint_position_target(target)
-            scene.write_data_to_sim()
-            sim.step()
-            scene.update(sim.get_physics_dt())
-
-        sim_p = get_sim_proprio()
-        rx, ry, rz = real_xyz[name]
-        print(f"\n[{name}]")
-        print(f"  Real: x={rx:.1f}  y={ry:.1f}  z={rz:.1f}")
-        print(f"  Sim:  x={sim_p[0]:.1f}  y={sim_p[1]:.1f}  z={sim_p[2]:.1f}")
-        print(f"  Diff: x={sim_p[0]-rx:.1f}  y={sim_p[1]-ry:.1f}  z={sim_p[2]-rz:.1f}")
+    print("\n[INFO] Script complete.")
 
 if __name__ == "__main__":
     main()
     simulation_app.close()
-
-# isim.bat C:\Users\NexusUser\IsaacLab\scripts\tools\convert_urdf.py C:\Users\NexusUser\thomas_sim\dobot.urdf C:\Users\NexusUser\thomas_sim\dobot.usd --fix-base --joint-target-type none
