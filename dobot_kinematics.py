@@ -60,7 +60,6 @@ class DobotKinematics:
         return urdf_targets
 
     def get_proprio(self, current_joint_pos, gripper_states):
-        """Calculates exact SDK (X, Y, Z, Grip) from simulated joint angles."""
         j1 = current_joint_pos[:, self.j1_idx]
         j2 = current_joint_pos[:, self.j2_idx]
         j3_rel = current_joint_pos[:, self.j3_idx]
@@ -72,4 +71,8 @@ class DobotKinematics:
         x = radius * torch.cos(j1)
         y = radius * torch.sin(j1)
 
-        return torch.stack([x, y, z, gripper_states.squeeze(-1)], dim=-1)
+        batch_size = x.shape[0]
+        zeros = torch.zeros(batch_size, device=self.device)
+
+        # Returns: [X, Y, Z, R (0), J1 (0), J2 (0), Grip]
+        return torch.stack([x, y, z, zeros, zeros, zeros, gripper_states.squeeze(-1)], dim=-1)

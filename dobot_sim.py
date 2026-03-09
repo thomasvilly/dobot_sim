@@ -1,7 +1,10 @@
 import argparse
 import random
+import os
+import h5py
 import torch
 import numpy as np
+import glob
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
@@ -39,8 +42,8 @@ DOBOT_CFG = ArticulationCfg(
     actuators={
         "joints": ImplicitActuatorCfg(
             joint_names_expr=["magician_joint_.*"],
-            stiffness=50.0,
-            damping=10.0,
+            stiffness=150.0, # Kept high for fast 30Hz tracking
+            damping=15.0,
         ),
     },
 )
@@ -51,16 +54,17 @@ class SceneCfg(InteractiveSceneCfg):
     robot  = DOBOT_CFG
     camera = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
-        offset=TiledCameraCfg.OffsetCfg(pos=(0.5, -0.5, 0.4), rot=(0.85, 0.35, -0.15, -0.35), convention="world"),
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.45, 0.10, 0.35), # 45cm forward, 10cm right, 35cm up
+            rot=(0.176, 0.380, 0.825, -0.380), # Angled back at robot
+            convention="world",
+        ),
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955),
         width=640, height=480,
     )
 
 def generate_episode(kinematics, robot, scene, sim, camera):
-    """Executes a single pick-and-place trajectory and records the sequence."""
-    
-    # Matching real-world zones from record_simple.py
     Z_SAFE  = -30.0   
     Z_PICK  = -75.0  
     Z_HOVER =  50.0 
@@ -70,63 +74,77 @@ def generate_episode(kinematics, robot, scene, sim, camera):
     place_x = random.uniform(140, 220)
     place_y = random.uniform(80, 200)
 
-    # Define the high-level PTP trajectory waypoints (X, Y, Z, Gripper)
     waypoints = [
-        [150.0, 40.0, Z_SAFE, -1.0],      # 1. Start at safe home
-        [pick_x, pick_y, Z_HOVER, -1.0],  # 2. Hover over pick
-        [pick_x, pick_y, Z_PICK,   1.0],  # 3. Drop down & GRAB
-        [pick_x, pick_y, Z_HOVER,  1.0],  # 4. Lift up
-        [place_x, place_y, Z_HOVER, 1.0], # 5. Move to place hover
-        [place_x, place_y, Z_PICK, -1.0], # 6. Drop down & RELEASE
-        [place_x, place_y, Z_HOVER, -1.0] # 7. Lift up
+        [150.0, 40.0, Z_SAFE, -1.0],      
+        [pick_x, pick_y, Z_HOVER, -1.0],  
+        [pick_x, pick_y, Z_PICK,   1.0],  
+        [pick_x, pick_y, Z_HOVER,  1.0],  
+        [place_x, place_y, Z_HOVER, 1.0], 
+        [place_x, place_y, Z_PICK, -1.0], 
+        [place_x, place_y, Z_HOVER, -1.0] 
     ]
 
     episode_data = []
     current_pos = torch.tensor(waypoints[0][:3], device="cuda").unsqueeze(0)
     
-    print(f"[INFO] Starting Episode: Pick({pick_x:.1f}, {pick_y:.1f}) -> Place({place_x:.1f}, {place_y:.1f})")
+    print(f"[INFO] Generating Episode: Pick({pick_x:.1f}, {pick_y:.1f}) -> Place({place_x:.1f}, {place_y:.1f})")
+
+    SPEED_MM_PER_FRAME = 8.0 # 8mm * 30Hz = 240mm/sec (matches your 4-second real-world speed)
 
     for target in waypoints:
         target_pos = torch.tensor(target[:3], device="cuda").unsqueeze(0)
         gripper_state = torch.tensor([[target[3]]], device="cuda")
         
-        # Calculate how many 20Hz steps to take based on distance (speed control)
         dist = torch.norm(target_pos - current_pos).item()
-        steps = max(10, int(dist / 2.0)) # Approx 2mm per frame
+        steps = max(3, int(dist / SPEED_MM_PER_FRAME))
 
         for step in range(steps):
-            # Interpolate to create a smooth path
             alpha = step / float(steps)
             interp_pos = current_pos + alpha * (target_pos - current_pos)
             
-            # 1. Math: XYZ -> SDK Angles -> URDF Targets
             sdk_angles = kinematics.inverse_kinematics(interp_pos)
             urdf_targets = kinematics.sdk_to_urdf_targets(sdk_angles)
-            
-            # 2. Physics: Apply targets and step sim
             robot.set_joint_position_target(urdf_targets)
             
-            # Step physics 10 times (200Hz) to simulate 1 control frame (20Hz)
-            for _ in range(10):
+            # 30Hz Control: 200Hz physics dt=0.005. Stepping 6 times = 0.03s per control frame
+            for _ in range(6):
                 scene.write_data_to_sim()
                 sim.step()
-                scene.update(sim.get_physics_dt())
 
-            # 3. Record: Capture State
+            # Render camera once per control frame
+            scene.update(sim.get_physics_dt() * 6)
+
             proprio = kinematics.get_proprio(robot.data.joint_pos, gripper_state)
             
-            # Assuming camera is enabled and returning valid data
-            img = camera.data.output["rgb"][0].cpu().numpy() if "rgb" in camera.data.output else None
+            if "rgb" in camera.data.output:
+                img = camera.data.output["rgb"][0].cpu().numpy()
+                if img.shape[-1] == 4: img = img[:, :, :3] # RGBA to RGB
+                
+                state_arr = proprio[0].cpu().numpy()
+                episode_data.append({
+                    "action": state_arr.copy(), # Pre-conversion format stores absolute states in action
+                    "state": state_arr.copy(),
+                    "top": img
+                })
             
-            episode_data.append({
-                "action": [*interp_pos[0].cpu().numpy(), gripper_state.item()],
-                "proprio": proprio[0].cpu().numpy(),
-                "image": img
-            })
-            
-        current_pos = target_pos # Update for next waypoint
+        current_pos = target_pos
 
     return episode_data
+
+def save_hdf5(buffer, dataset_dir="dataset_hdf5/sim_session"):
+    if not buffer: return
+    os.makedirs(dataset_dir, exist_ok=True)
+    
+    next_id = len(glob.glob(os.path.join(dataset_dir, "episode_*.h5"))) + 1
+    fname = os.path.join(dataset_dir, f"episode_{next_id:03d}.h5")
+    
+    print(f"--> Saving {fname}...")
+    with h5py.File(fname, 'w') as f:
+        f.create_dataset('observations/images/top', data=np.array([b['top'] for b in buffer]), compression="gzip")
+        f.create_dataset('observations/state', data=np.array([b['state'] for b in buffer]))
+        f.create_dataset('action', data=np.array([b['action'] for b in buffer]))
+        f.attrs['instruction'] = "pick up the blue block and put it on the plate"
+    print("Saved.")
 
 def main():
     sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=0.005, gravity=(0.0, 0.0, -9.81)))
@@ -137,22 +155,18 @@ def main():
     camera = scene["camera"]
     kinematics = DobotKinematics(robot.data.joint_names, device="cuda")
 
-    # Settle the physics engine
     print("[INFO] Settling...")
-    for _ in range(400):
+    for _ in range(200):
         robot.set_joint_position_target(robot.data.default_joint_pos.clone())
         scene.write_data_to_sim()
         sim.step()
         scene.update(sim.get_physics_dt())
 
-    print("[INFO] Settled. Generating episodes...")
-
-    # Run 3 test episodes
-    for i in range(3):
-        ep_data = generate_episode(kinematics, robot, scene, sim, camera)
-        print(f"--> Episode {i+1} completed with {len(ep_data)} frames.")
-
-    print("\n[INFO] Script complete.")
+    # Generate 1 Test Episode
+    ep_data = generate_episode(kinematics, robot, scene, sim, camera)
+    print(f"--> Episode completed with {len(ep_data)} frames.")
+    
+    save_hdf5(ep_data)
 
 if __name__ == "__main__":
     main()
