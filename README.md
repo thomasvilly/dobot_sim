@@ -1,135 +1,78 @@
-# Template for Isaac Lab Projects
+# Dobot Magician — Pick-and-Place PPO Environment
 
-## Overview
+## Files
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+| File | Purpose |
+|------|---------|
+| `dobot_env_cfg.py` | Scene + environment config (robots, objects, spaces, reward weights) |
+| `dobot_env.py` | `DirectRLEnv` implementation (obs, reward, reset, suction gripper) |
+| `dobot_kinematics.py` | **Unchanged** from previous session — IK, FK, coordinate conversion |
+| `train.py` | Launch PPO training via rsl-rl |
+| `record.py` | Run trained policy, save HDF5 for SFT |
 
-**Key Features:**
+## Setup
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+Copy all files into `C:\Users\NexusUser\thomas_sim\` alongside `dobot_kinematics.py` and `dobot.usd`.
 
-**Keywords:** extension, template, isaaclab
+## Training
 
-## Installation
+```bat
+# Headless, 64 parallel envs
+isim.bat train.py --num_envs 64 --headless --max_iter 3000
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
+# With viewer (fewer envs)
+isim.bat train.py --num_envs 8 --max_iter 3000
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
-
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/thomas_sim
-
-- Verify that the extension is correctly installed by:
-
-    - Listing the available tasks:
-
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
-
-    - Running a task:
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-
-    - Running a task with dummy agents:
-
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
-
-        - Zero-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
-
-### Set up IDE (Optional)
-
-To setup the IDE, please follow these instructions:
-
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
-
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
-
-### Setup as Omniverse Extension (Optional)
-
-We provide an example UI extension that will load upon enabling your extension defined in `source/thomas_sim/thomas_sim/ui_extension_example.py`.
-
-To enable your extension, follow these steps:
-
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
-
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
-
-## Code formatting
-
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
-
-```bash
-pip install pre-commit
+# Resume from checkpoint
+isim.bat train.py --num_envs 64 --headless --resume logs/dobot_ppo/run_001/model_1000.pt
 ```
 
-Then you can run pre-commit with:
+Checkpoints save every 100 iterations to `logs/dobot_ppo/`.
+Monitor with TensorBoard: `tensorboard --logdir logs/dobot_ppo`
 
-```bash
-pre-commit run --all-files
+## Recording SFT data
+
+```bat
+isim.bat record.py --checkpoint logs/dobot_ppo/run_001/model_3000.pt --num_episodes 200 --enable_cameras
 ```
 
-## Troubleshooting
+Output: `dataset_hdf5/sim_ppo/episode_NNN.h5` — same format as real robot data.
 
-### Pylance Missing Indexing of Extensions
+## Key design decisions
 
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
+### Coordinate system
+Proprio is output in Dobot SDK mm space via `world_to_sdk()` — exactly matching real `GetPose()` output. This is the alignment work from the previous session, preserved here.
 
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/thomas_sim"
-    ]
-}
-```
+### Action space
+4-dim Cartesian delta: `[dx, dy, dz, d_gripper]` in world metres.
+- Scale: 5 mm per policy step (20 Hz effective rate, physics at 200 Hz with decimation=10)
+- Gripper: continuous logit thresholded at 0 for suction on/off
 
-### Pylance Crash
+### Gripper
+Fake suction (same as previous session). Spring force holds block to EE when:
+1. `d_gripper > 0` (gripper command on)
+2. EE is within 35 mm XY and 60 mm Z of block
 
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
+### Reward shaping
+| Term | Weight | Signal |
+|------|--------|--------|
+| Reach (exp) | 1.0 | EE → block distance, only when not holding |
+| Lift | 2.0 | Block height above floor, only when holding |
+| Transport (exp) | 5.0 | Block → plate XY distance, when holding and lifted |
+| Success | 10.0 | Block on plate, gripper released |
+| Action penalty | 0.01 | L2 norm of actions (smoothness) |
 
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
-```
+### Extensibility
+To add a new task (e.g. stack, sort):
+1. Subclass `DobotEnvCfg` — add new objects, change zones, update `observation_space`
+2. Subclass `DobotEnv` — override `_get_rewards()` and `_get_dones()`
+3. The robot, kinematics, camera, and suction gripper all carry over unchanged
+
+## Tuning guide
+
+Start here if policy doesn't learn:
+- **Gripper not triggering**: lower `action_scale_xyz` so policy can hover precisely; or widen grab thresholds in `_apply_suction`
+- **Never lifts**: increase `rew_lift_weight`; check `lift_height_threshold`
+- **Lifts but drops**: suction spring constant too low — increase `2000.0` in `_apply_suction`
+- **Never releases**: add a small bonus for gripper=off when block is near plate
+- **Too slow to converge**: increase `num_envs`; RTX A6000 should handle 256+ envs comfortably

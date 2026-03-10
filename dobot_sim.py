@@ -44,7 +44,7 @@ DOBOT_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.112),
+        pos=(0.0, 0.0, 0.112), # Restored to prevent floor collisions!
         joint_pos={
             "magician_joint_1":         0.0,
             "magician_joint_2":         0.8,
@@ -82,8 +82,8 @@ class SceneCfg(InteractiveSceneCfg):
     camera = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.60, 0.00, 0.30), # Moved 20cm back, 5cm up
-            rot=euler_to_quat(roll=0, pitch=45, yaw=180), # Pitched slightly more forward
+            pos=(0.60, 0.00, 0.30), 
+            rot=euler_to_quat(roll=0, pitch=25, yaw=180), 
             convention="world",
         ),
         data_types=["rgb"],
@@ -91,114 +91,7 @@ class SceneCfg(InteractiveSceneCfg):
         width=640, height=480,
     )
 
-def generate_episode(kinematics, robot, scene, sim, camera):
-    block = scene["block"]
-    
-    Z_SAFE  = -30.0   
-    Z_PICK  = -75.0  
-    Z_HOVER =  50.0 
-    
-    pick_x  = random.uniform(100, 160)
-    pick_y  = random.uniform(-120, 0)
-    place_x = random.uniform(140, 220)
-    place_y = random.uniform(80, 200)
 
-    block_state = block.data.default_root_state.clone()
-    block_state[:, 0] = pick_x / 1000.0
-    block_state[:, 1] = pick_y / 1000.0
-    block_state[:, 2] = 0.015 
-    block.write_root_state_to_sim(block_state)
-
-    waypoints = [
-        [150.0, 40.0, Z_SAFE, -1.0],      
-        [pick_x, pick_y, Z_HOVER, -1.0],  
-        [pick_x, pick_y, Z_PICK,   1.0],  
-        [pick_x, pick_y, Z_HOVER,  1.0],  
-        [place_x, place_y, Z_HOVER, 1.0], 
-        [place_x, place_y, Z_PICK, -1.0], 
-        [place_x, place_y, Z_HOVER, -1.0] 
-    ]
-
-    episode_data = []
-    current_pos = torch.tensor(waypoints[0][:3], device="cuda").unsqueeze(0)
-    is_holding = False
-    
-    print(f"[INFO] Generating Episode: Pick({pick_x:.1f}, {pick_y:.1f}) -> Place({place_x:.1f}, {place_y:.1f})")
-
-    SPEED_MM_PER_FRAME = 20.0 
-
-    for target in waypoints:
-        target_pos = torch.tensor(target[:3], device="cuda").unsqueeze(0)
-        gripper_state = torch.tensor([[target[3]]], device="cuda")
-        
-        dist = torch.norm(target_pos - current_pos).item()
-        steps = max(2, int(dist / SPEED_MM_PER_FRAME))
-
-        for step in range(steps):
-            alpha = step / float(steps)
-            interp_pos = current_pos + alpha * (target_pos - current_pos)
-            
-            sdk_angles = kinematics.inverse_kinematics(interp_pos)
-            urdf_targets = kinematics.sdk_to_urdf_targets(sdk_angles)
-            robot.set_joint_position_target(urdf_targets)
-            
-            for _ in range(6):
-                actual_proprio = kinematics.get_proprio(robot.data.joint_pos, gripper_state)
-                actual_tcp = actual_proprio[0, :3] / 1000.0
-                actual_tcp[2] += 0.112 
-
-                forces = torch.zeros((1, 1, 3), device="cuda")
-                torques = torch.zeros((1, 1, 3), device="cuda")
-                
-                if gripper_state.item() == 1.0:
-                    block_pos = block.data.root_pos_w[0]
-                    
-                    if not is_holding:
-                        dist_xy = torch.norm(actual_tcp[:2] - block_pos[:2]).item()
-                        dist_z = abs((actual_tcp[2] - 0.015) - block_pos[2]).item()
-                        if dist_xy < 0.03 and dist_z < 0.03: # Tightened grab threshold
-                            is_holding = True
-                    
-                    if is_holding:
-                        block_vel = block.data.root_lin_vel_w[0]
-                        suction_target = actual_tcp.clone()
-                        
-                        # 0.015 (block half-height) + 0.001 (air gap to stop collisions)
-                        suction_target[2] -= 0.016 
-                        
-                        # Unclamped, ultra-stiff, mathematically perfectly damped spring
-                        kp = 2000.0  
-                        kd = 20.0    # kd = 2 * sqrt(kp * mass) = 2 * sqrt(2000 * 0.05)
-                        
-                        force = (kp * (suction_target - block_pos)) - (kd * block_vel)
-                        force[2] += 0.05 * 9.81 
-                        
-                        forces[0, 0] = force
-                else:
-                    is_holding = False
-                    
-                block.set_external_force_and_torque(forces, torques)
-                
-                scene.write_data_to_sim()
-                sim.step()
-
-            scene.update(sim.get_physics_dt() * 6)
-            proprio = kinematics.get_proprio(robot.data.joint_pos, gripper_state)
-            
-            if "rgb" in camera.data.output:
-                img = camera.data.output["rgb"][0].cpu().numpy()
-                if img.shape[-1] == 4: img = img[:, :, :3] 
-                
-                state_arr = proprio[0].cpu().numpy()
-                episode_data.append({
-                    "action": state_arr.copy(),
-                    "state": state_arr.copy(),
-                    "top": img
-                })
-            
-        current_pos = target_pos
-
-    return episode_data
 
 def save_hdf5(buffer, dataset_dir="dataset_hdf5/sim_session"):
     if not buffer: return
