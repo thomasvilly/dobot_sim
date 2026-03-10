@@ -1,110 +1,101 @@
 """
 train.py
-Train the Dobot pick-and-place policy with PPO via rsl-rl.
+Train the Dobot pick-and-place policy using rl_games PPO via Isaac Lab.
 
-Usage (from thomas_sim directory):
-    isim.bat train.py --num_envs 64 --headless
-    isim.bat train.py --num_envs 16               # with viewer
-    isim.bat train.py --num_envs 64 --headless --resume logs/dobot_ppo/run_XXX/model_1000.pt
+Usage:
+    isim.bat train.py --num_envs 64 --headless --max_iter 3000
+    isim.bat train.py --num_envs 8                              # with viewer
 """
-from __future__ import annotations
-
 import argparse
-import os
 import sys
+import os
 
-# ---- Isaac Lab app must be launched BEFORE any omniverse imports ----
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Train Dobot pick-and-place with PPO")
-parser.add_argument("--num_envs",  type=int,   default=64)
-parser.add_argument("--max_iter",  type=int,   default=3000, help="PPO iterations")
-parser.add_argument("--resume",    type=str,   default=None, help="Path to checkpoint to resume from")
-parser.add_argument("--log_dir",   type=str,   default="logs/dobot_ppo")
+parser = argparse.ArgumentParser(description="Train Dobot pick-and-place")
+parser.add_argument("--num_envs",   type=int,  default=64)
+parser.add_argument("--max_iter",   type=int,  default=3000)
+parser.add_argument("--checkpoint", type=str,  default=None)
 AppLauncher.add_app_launcher_args(parser)
-args = parser.parse_args()
-AppLauncher(args).app  # keeps app alive for the duration of the script
+args_cli, hydra_args = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + hydra_args
 
-# ---- Now safe to import Isaac / torch ----
-import torch
-from rsl_rl.runners import OnPolicyRunner
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
-from isaaclab.utils import configclass
+"""Everything after this point runs inside the Isaac Sim environment."""
+
+import yaml
+import gymnasium as gym
+from datetime import datetime
+
+from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
+from rl_games.common import env_configurations, vecenv
+from rl_games.common.algo_observer import IsaacAlgoObserver
+from rl_games.torch_runner import Runner
+
+import dobot_env_register  # noqa: F401 — registers Isaac-Dobot-Pick-Place-v0
 
 from dobot_env_cfg import DobotEnvCfg
-from dobot_env     import DobotEnv
 
 
-# ---------------------------------------------------------------------------
-# rsl-rl runner config
-# ---------------------------------------------------------------------------
-@configclass
-class DobotPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env: int = 24        # rollout steps collected before each PPO update
-    max_iterations:    int = args.max_iter
-    save_interval:     int = 100
-    experiment_name:   str = "dobot_pick_place"
-    run_name:          str = ""
-    resume:            bool = args.resume is not None
-    load_run:          str = args.resume or ""
-    load_checkpoint:   str = ""
-    logger:            str = "tensorboard"
-    log_dir:           str = args.log_dir
-
-    policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
-        # Observation is huge (image + proprio).
-        # Use a small CNN encoder outside rsl-rl, or flatten with MLP.
-        # Here we use a plain MLP — works for proprio-only ablation too.
-        init_noise_std=1.0,
-        actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[512, 256, 128],
-        activation="elu",
-    )
-
-    algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.005,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1e-4,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
-    # Build env config with CLI num_envs
-    env_cfg            = DobotEnvCfg()
-    env_cfg.scene.num_envs = args.num_envs
+    # 1. Build env
+    env_cfg = DobotEnvCfg()
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env = gym.make("Isaac-Dobot-Pick-Place-v0", cfg=env_cfg)
 
-    # Headless → disable camera rendering during training to save VRAM
-    # (re-enable for play/record)
-    if args.headless:
-        # Still need camera for obs — just don't render the viewport
-        pass
+    # 2. Wrap for rl_games
+    rl_device = "cuda:0"
+    env = RlGamesVecEnvWrapper(env, rl_device=rl_device, clip_obs=10.0, clip_actions=1.0)
 
-    env = DobotEnv(cfg=env_cfg)
+    vecenv.register(
+        "ISAACLAB",
+        lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
+    )
+    env_configurations.register(
+        "rlgpu",
+        {"vecenv_type": "ISAACLAB", "env_creator": lambda **kwargs: env},
+    )
 
-    runner_cfg = DobotPPORunnerCfg()
-    runner     = OnPolicyRunner(env, runner_cfg, log_dir=runner_cfg.log_dir, device=env.device)
+    # 3. Load YAML
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_games_ppo_cfg.yaml")
+    with open(cfg_path) as f:
+        rl_games_cfg = yaml.safe_load(f)
 
-    if args.resume:
-        runner.load(args.resume)
-        print(f"[train] Resumed from {args.resume}")
+    rl_games_cfg["params"]["config"]["max_epochs"]  = args_cli.max_iter
+    rl_games_cfg["params"]["config"]["num_actors"]  = args_cli.num_envs
 
-    runner.learn(num_learning_iterations=runner_cfg.max_iterations, init_at_random_ep_len=True)
+    # Fix minibatch so total_steps % minibatch == 0
+    horizon     = rl_games_cfg["params"]["config"]["horizon_length"]
+    total_steps = args_cli.num_envs * horizon
+    minibatch   = rl_games_cfg["params"]["config"]["minibatch_size"]
+    while total_steps % minibatch != 0:
+        minibatch //= 2
+    rl_games_cfg["params"]["config"]["minibatch_size"] = minibatch
+    print(f"[train] num_envs={args_cli.num_envs}, horizon={horizon}, "
+          f"total_steps={total_steps}, minibatch={minibatch}")
+
+    # Log dir
+    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir  = os.path.join("logs", "rl_games", "dobot_pick_place", run_name)
+    os.makedirs(log_dir, exist_ok=True)
+    rl_games_cfg["params"]["config"]["train_dir"]             = os.path.abspath(log_dir)
+    rl_games_cfg["params"]["config"]["full_experiment_name"]  = run_name
+
+    if args_cli.checkpoint:
+        rl_games_cfg["params"]["load_checkpoint"] = True
+        rl_games_cfg["params"]["load_path"]       = args_cli.checkpoint
+
+    # 4. Train
+    runner = Runner(IsaacAlgoObserver())
+    runner.load(rl_games_cfg)
+    runner.reset()
+    runner.run({"train": True, "play": False, "sigma": None})
 
     env.close()
 
 
 if __name__ == "__main__":
     main()
+    simulation_app.close()

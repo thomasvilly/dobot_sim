@@ -76,34 +76,25 @@ class DobotEnv(DirectRLEnv):
         print(f"[DobotEnv] EE body idx={self._ee_idx}, base body idx={self._base_idx}")
 
     def _setup_scene(self):
-        """Spawn all assets, clone environments, register with scene."""
-        # Robot
-        self.robot = Articulation(self.cfg.scene.robot)
-        self.scene.articulations["robot"] = self.robot
+        """Retrieve assets already spawned by InteractiveScene (from DobotSceneCfg),
+        then add world-level prims (ground plane, dome light) that live outside
+        the cloned env hierarchy."""
 
-        # Block
-        self.block = RigidObject(self.cfg.scene.block)
-        self.scene.rigid_objects["block"] = self.block
+        # InteractiveScene has already constructed everything declared in DobotSceneCfg.
+        # We just grab references here so the rest of the class can use them.
+        self.robot      = self.scene.articulations["robot"]
+        self.block      = self.scene.rigid_objects["block"]
+        self.plate      = self.scene.rigid_objects["plate"]
+        # Camera is optional — only used during record.py
+        if self.cfg.use_camera and "camera" in self.scene.sensors:
+            self.camera = self.scene.sensors["camera"]
+        else:
+            self.camera = None
+        self.ee_contact = self.scene.sensors["ee_contact"]
 
-        # Plate (static target)
-        self.plate = RigidObject(self.cfg.scene.plate)
-        self.scene.rigid_objects["plate"] = self.plate
-
-        # Camera
-        self.camera = TiledCamera(self.cfg.scene.camera)
-        self.scene.sensors["camera"] = self.camera
-
-        # Contact sensor: EE ↔ Block only (single body, filtered)
-        self.ee_contact = ContactSensor(self.cfg.scene.ee_contact)
-        self.scene.sensors["ee_contact"] = self.ee_contact
-
-        # Ground plane & light (not cloned, world-level)
+        # Ground plane and dome light are world-level (not inside any env prim).
         sim_utils.spawn_ground_plane(prim_path="/World/ground", cfg=sim_utils.GroundPlaneCfg())
         sim_utils.DomeLightCfg(intensity=3000.0).func("/World/Light", sim_utils.DomeLightCfg(intensity=3000.0))
-
-        # Clone environments & filter collisions between env copies
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=["/World/ground"])
 
     # ------------------------------------------------------------------
     # Action pipeline
@@ -256,18 +247,42 @@ class DobotEnv(DirectRLEnv):
     # ------------------------------------------------------------------
     def _get_observations(self) -> dict:
         """
-        Returns dict with key "policy" → flat tensor (num_envs, obs_dim).
-        obs_dim = H*W*3 + 7
+        Returns {"policy": tensor(num_envs, 14)} for training.
+        If use_camera=True (record mode) also includes "rgb" key.
+
+        14-dim proprio observation:
+          ee_pos_mm(3) + block_pos_mm(3) + block_to_plate_mm(3) +
+          gripper(1)   + ee_vel_mm_s(3)  + holding(1)
         """
-        # Camera: (num_envs, H, W, 3) uint8 → float [0,1]
-        rgb = self.camera.data.output["rgb"][:, :, :, :3].float() / 255.0
-        rgb_flat = rgb.reshape(self.num_envs, -1)   # (N, 480*640*3)
+        # EE and base world positions → relative in mm
+        ee_w   = self.robot.data.body_pos_w[:, self._ee_idx, :]
+        base_w = self.robot.data.body_pos_w[:, self._base_idx, :]
+        ee_mm  = (ee_w - base_w) * 1000.0                          # (N,3)
 
-        # Proprio in SDK mm space
-        proprio = self._get_proprio_sdk()            # (N, 7)
+        # Block position relative to robot base in mm
+        blk_w  = self.block.data.root_pos_w
+        blk_mm = (blk_w - base_w) * 1000.0                         # (N,3)
 
-        obs = torch.cat([rgb_flat, proprio], dim=-1)
-        return {"policy": obs}
+        # Vector from block to plate in mm (goal direction)
+        plate_w = self.plate.data.root_pos_w
+        to_plate = (plate_w - blk_w) * 1000.0                      # (N,3)
+
+        # Gripper state: 1=on, 0=off
+        gripper = self._gripper_on.float().unsqueeze(-1)            # (N,1)
+
+        # EE velocity in mm/s
+        ee_vel = self.robot.data.body_lin_vel_w[:, self._ee_idx, :] * 1000.0  # (N,3)
+
+        # Holding flag
+        holding = self._holding.float().unsqueeze(-1)               # (N,1)
+
+        obs = torch.cat([ee_mm, blk_mm, to_plate, gripper, ee_vel, holding], dim=-1)  # (N,14)
+
+        obs_dict = {"policy": obs}
+        if self.camera is not None:
+            rgb = self.camera.data.output["rgb"][:, :, :, :3].float() / 255.0
+            obs_dict["rgb"] = rgb
+        return obs_dict
 
     def _get_proprio_sdk(self) -> torch.Tensor:
         """
@@ -316,7 +331,7 @@ class DobotEnv(DirectRLEnv):
         success_rew = success.float()
 
         # 5. Action penalty (smoothness)
-        action_pen = self._actions.norm(dim=-1) * self.cfg.rew_action_penalty
+        action_pen = self.actions.norm(dim=-1) * self.cfg.rew_action_penalty
 
         total = (
             self.cfg.rew_reach_weight   * reach_rew

@@ -74,8 +74,8 @@ DOBOT_CFG = ArticulationCfg(
 class DobotSceneCfg(InteractiveSceneCfg):
     """Scene: robot + block + plate + camera."""
 
-    ground = sim_utils.GroundPlaneCfg()
-    light  = sim_utils.DomeLightCfg(intensity=3000.0)
+    # NOTE: ground plane and lights are spawned in DobotEnv._setup_scene(),
+    # not here — InteractiveScene only accepts articulations/rigid objects/sensors.
 
     robot: ArticulationCfg = DOBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
@@ -116,20 +116,10 @@ class DobotSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.18, 0.14, 0.0025)),
     )
 
-    camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera",
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.60, 0.00, 0.30),
-            rot=euler_to_quat(roll_deg=0, pitch_deg=25, yaw_deg=180),
-            convention="world",
-        ),
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955
-        ),
-        width=640,
-        height=480,
-    )
+    # Camera is intentionally omitted here.
+    # It is added dynamically in _setup_scene() only when use_camera=True
+    # (i.e. during record.py, not during train.py).
+    camera: TiledCameraCfg | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +140,9 @@ PLACE_RADIUS = 0.06               # success if block within this radius of plate
 # ---------------------------------------------------------------------------
 @configclass
 class DobotEnvCfg(DirectRLEnvCfg):
+    # Set True only in record.py to enable TiledCamera
+    use_camera: bool = False
+
     # ---- timing ----
     # physics at 200 Hz, policy at 20 Hz  →  decimation = 10
     decimation: int = 10
@@ -162,10 +155,11 @@ class DobotEnvCfg(DirectRLEnvCfg):
     # ---- spaces ----
     # Actions: [dx, dy, dz, d_gripper]  (Cartesian deltas in metres + gripper)
     action_space: int = 4
-    # Observations: camera RGB flattened (480*640*3) + proprio (7)
-    # We return a dict so the policy can handle the two modalities separately.
-    # For rsl-rl we'll flatten to a single vector; set observation_space accordingly.
-    observation_space: int = 480 * 640 * 3 + 7
+    # Observations for training: compact proprio only (14-dim)
+    # ee_pos_mm(3) + block_pos_mm(3) + block_to_plate_mm(3) + gripper(1) +
+    # ee_vel_mm(3) + holding(1)  = 14
+    # Camera RGB is only used in record.py.
+    observation_space: int = 14
     state_space: int = 0
 
     # ---- task-specific ----

@@ -78,9 +78,15 @@ class DobotKinematics:
         return torch.stack([x, y, z, zeros, zeros, zeros, gripper_states.squeeze(-1)], dim=-1)
     
     def world_to_sdk(self, world_pos_m, base_height_m=0.112):
-        """Convert Isaac world position (meters) to SDK Cartesian space (mm)."""
-        # SDK origin is at the robot base center, which is at world z=base_height_m
-        x_mm = world_pos_m[0] * 1000.0
-        y_mm = world_pos_m[1] * 1000.0
-        z_mm = (world_pos_m[2] - base_height_m) * 1000.0
-        return torch.tensor([[x_mm, y_mm, z_mm]], device=self.device)
+        """Convert Isaac world position (meters) to SDK Cartesian space (mm).
+
+        Accepts either:
+          - a 1-D tensor of shape (3,)  → returns shape (1, 3)
+          - a 2-D tensor of shape (N, 3) → returns shape (N, 3)
+        """
+        if world_pos_m.dim() == 1:
+            world_pos_m = world_pos_m.unsqueeze(0)   # (1, 3)
+        x_mm = world_pos_m[:, 0] * 1000.0
+        y_mm = world_pos_m[:, 1] * 1000.0
+        z_mm = (world_pos_m[:, 2] - base_height_m) * 1000.0
+        return torch.stack([x_mm, y_mm, z_mm], dim=-1)  # (N, 3)
