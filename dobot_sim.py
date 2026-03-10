@@ -3,6 +3,7 @@ import random
 import os
 import h5py
 import torch
+import math
 import numpy as np
 import glob
 from isaaclab.app import AppLauncher
@@ -12,12 +13,25 @@ AppLauncher.add_app_launcher_args(parser)
 simulation_app = AppLauncher(parser.parse_args()).app
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg, ArticulationCfg
+from isaaclab.assets import AssetBaseCfg, ArticulationCfg, RigidObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import TiledCameraCfg
 
 from dobot_kinematics import DobotKinematics
+
+def euler_to_quat(roll, pitch, yaw):
+    cr = math.cos(math.radians(roll) * 0.5)
+    sr = math.sin(math.radians(roll) * 0.5)
+    cp = math.cos(math.radians(pitch) * 0.5)
+    sp = math.sin(math.radians(pitch) * 0.5)
+    cy = math.cos(math.radians(yaw) * 0.5)
+    sy = math.sin(math.radians(yaw) * 0.5)
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return (w, x, y, z)
 
 DOBOT_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
@@ -42,8 +56,8 @@ DOBOT_CFG = ArticulationCfg(
     actuators={
         "joints": ImplicitActuatorCfg(
             joint_names_expr=["magician_joint_.*"],
-            stiffness=150.0, # Kept high for fast 30Hz tracking
-            damping=15.0,
+            stiffness=400.0, 
+            damping=40.0,
         ),
     },
 )
@@ -52,11 +66,24 @@ class SceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
     light  = AssetBaseCfg(prim_path="/World/light",  spawn=sim_utils.DomeLightCfg(intensity=3000.0))
     robot  = DOBOT_CFG
+    
+    block = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Block",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.03, 0.03, 0.03),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)), 
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.15, -0.05, 0.015)),
+    )
+    
     camera = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.45, 0.10, 0.35), # 45cm forward, 10cm right, 35cm up
-            rot=(0.176, 0.380, 0.825, -0.380), # Angled back at robot
+            pos=(0.60, 0.00, 0.30), # Moved 20cm back, 5cm up
+            rot=euler_to_quat(roll=0, pitch=45, yaw=180), # Pitched slightly more forward
             convention="world",
         ),
         data_types=["rgb"],
@@ -65,6 +92,8 @@ class SceneCfg(InteractiveSceneCfg):
     )
 
 def generate_episode(kinematics, robot, scene, sim, camera):
+    block = scene["block"]
+    
     Z_SAFE  = -30.0   
     Z_PICK  = -75.0  
     Z_HOVER =  50.0 
@@ -73,6 +102,12 @@ def generate_episode(kinematics, robot, scene, sim, camera):
     pick_y  = random.uniform(-120, 0)
     place_x = random.uniform(140, 220)
     place_y = random.uniform(80, 200)
+
+    block_state = block.data.default_root_state.clone()
+    block_state[:, 0] = pick_x / 1000.0
+    block_state[:, 1] = pick_y / 1000.0
+    block_state[:, 2] = 0.015 
+    block.write_root_state_to_sim(block_state)
 
     waypoints = [
         [150.0, 40.0, Z_SAFE, -1.0],      
@@ -86,17 +121,18 @@ def generate_episode(kinematics, robot, scene, sim, camera):
 
     episode_data = []
     current_pos = torch.tensor(waypoints[0][:3], device="cuda").unsqueeze(0)
+    is_holding = False
     
     print(f"[INFO] Generating Episode: Pick({pick_x:.1f}, {pick_y:.1f}) -> Place({place_x:.1f}, {place_y:.1f})")
 
-    SPEED_MM_PER_FRAME = 8.0 # 8mm * 30Hz = 240mm/sec (matches your 4-second real-world speed)
+    SPEED_MM_PER_FRAME = 20.0 
 
     for target in waypoints:
         target_pos = torch.tensor(target[:3], device="cuda").unsqueeze(0)
         gripper_state = torch.tensor([[target[3]]], device="cuda")
         
         dist = torch.norm(target_pos - current_pos).item()
-        steps = max(3, int(dist / SPEED_MM_PER_FRAME))
+        steps = max(2, int(dist / SPEED_MM_PER_FRAME))
 
         for step in range(steps):
             alpha = step / float(steps)
@@ -106,23 +142,56 @@ def generate_episode(kinematics, robot, scene, sim, camera):
             urdf_targets = kinematics.sdk_to_urdf_targets(sdk_angles)
             robot.set_joint_position_target(urdf_targets)
             
-            # 30Hz Control: 200Hz physics dt=0.005. Stepping 6 times = 0.03s per control frame
             for _ in range(6):
+                actual_proprio = kinematics.get_proprio(robot.data.joint_pos, gripper_state)
+                actual_tcp = actual_proprio[0, :3] / 1000.0
+                actual_tcp[2] += 0.112 
+
+                forces = torch.zeros((1, 1, 3), device="cuda")
+                torques = torch.zeros((1, 1, 3), device="cuda")
+                
+                if gripper_state.item() == 1.0:
+                    block_pos = block.data.root_pos_w[0]
+                    
+                    if not is_holding:
+                        dist_xy = torch.norm(actual_tcp[:2] - block_pos[:2]).item()
+                        dist_z = abs((actual_tcp[2] - 0.015) - block_pos[2]).item()
+                        if dist_xy < 0.03 and dist_z < 0.03: # Tightened grab threshold
+                            is_holding = True
+                    
+                    if is_holding:
+                        block_vel = block.data.root_lin_vel_w[0]
+                        suction_target = actual_tcp.clone()
+                        
+                        # 0.015 (block half-height) + 0.001 (air gap to stop collisions)
+                        suction_target[2] -= 0.016 
+                        
+                        # Unclamped, ultra-stiff, mathematically perfectly damped spring
+                        kp = 2000.0  
+                        kd = 20.0    # kd = 2 * sqrt(kp * mass) = 2 * sqrt(2000 * 0.05)
+                        
+                        force = (kp * (suction_target - block_pos)) - (kd * block_vel)
+                        force[2] += 0.05 * 9.81 
+                        
+                        forces[0, 0] = force
+                else:
+                    is_holding = False
+                    
+                block.set_external_force_and_torque(forces, torques)
+                
                 scene.write_data_to_sim()
                 sim.step()
 
-            # Render camera once per control frame
             scene.update(sim.get_physics_dt() * 6)
-
             proprio = kinematics.get_proprio(robot.data.joint_pos, gripper_state)
             
             if "rgb" in camera.data.output:
                 img = camera.data.output["rgb"][0].cpu().numpy()
-                if img.shape[-1] == 4: img = img[:, :, :3] # RGBA to RGB
+                if img.shape[-1] == 4: img = img[:, :, :3] 
                 
                 state_arr = proprio[0].cpu().numpy()
                 episode_data.append({
-                    "action": state_arr.copy(), # Pre-conversion format stores absolute states in action
+                    "action": state_arr.copy(),
                     "state": state_arr.copy(),
                     "top": img
                 })
@@ -162,7 +231,6 @@ def main():
         sim.step()
         scene.update(sim.get_physics_dt())
 
-    # Generate 1 Test Episode
     ep_data = generate_episode(kinematics, robot, scene, sim, camera)
     print(f"--> Episode completed with {len(ep_data)} frames.")
     
